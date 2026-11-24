@@ -1,7 +1,7 @@
 {
   "id": "discord",
   "name": "Discord",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Talk to any Vicuna Work session from Discord DMs, with pairing, live progress, questions, attachments, and voice memos.",
   "bridge": {
     "name": "Discord",

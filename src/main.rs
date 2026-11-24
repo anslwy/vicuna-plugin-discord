@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -121,7 +121,9 @@ pub fn invite_url(bot_id: &str) -> String {
         String::new()
     } else {
         // permissions=2048 (Send Messages) lets the user add the bot to a private server so they can DM it.
-        format!("https://discord.com/oauth2/authorize?client_id={bot_id}&scope=bot&permissions=2048")
+        format!(
+            "https://discord.com/oauth2/authorize?client_id={bot_id}&scope=bot&permissions=2048"
+        )
     }
 }
 
@@ -144,6 +146,16 @@ struct BridgeRt {
     model_menu: Option<(String, Vec<String>)>,
     /// turn_id -> progress Discord message_id
     progress_msg: HashMap<String, String>,
+    turns: HashMap<String, TurnProgress>,
+}
+
+#[derive(Clone)]
+struct TurnProgress {
+    started: Instant,
+    current_tool: Option<String>,
+    tool_started: Option<Instant>,
+    tool_lines: Vec<String>,
+    snapshot: String,
 }
 
 #[derive(Default)]
@@ -347,11 +359,7 @@ async fn ack_interaction_update(
     .await;
 }
 
-async fn ack_interaction_defer_update(
-    token: &str,
-    interaction_id: &str,
-    interaction_token: &str,
-) {
+async fn ack_interaction_defer_update(token: &str, interaction_id: &str, interaction_token: &str) {
     let _ = discord_req(
         reqwest::Method::POST,
         token,
@@ -400,6 +408,88 @@ pub fn chunks(text: &str) -> Vec<String> {
     out
 }
 
+fn elapsed_text(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+fn status_line(state: &TurnProgress, now: Instant) -> String {
+    let mut s = format!(
+        "⏳ Working… {}",
+        elapsed_text(now.duration_since(state.started))
+    );
+    if let (Some(tool), Some(at)) = (&state.current_tool, state.tool_started) {
+        s.push_str(&format!(
+            " · {} running {}",
+            tool,
+            elapsed_text(now.duration_since(at))
+        ));
+    }
+    s
+}
+
+fn compact_tool_line(raw: &str) -> String {
+    let line = raw.lines().next().unwrap_or("").trim();
+    let line = line.strip_prefix("▸ ").unwrap_or(line);
+    let safe = line.replace('`', "ˋ").replace('\n', " ");
+    let clipped: String = safe.chars().take(132).collect();
+    let clipped = if safe.chars().count() > 132 {
+        format!("{clipped}…")
+    } else {
+        clipped
+    };
+    format!("▸ `{clipped}`")
+}
+
+fn progress_content(state: &TurnProgress, now: Instant) -> String {
+    let mut lines = state.tool_lines.clone();
+    if !state.snapshot.is_empty() {
+        let snap = compact_snapshot(&state.snapshot);
+        if !snap.is_empty() {
+            lines.push(snap);
+        }
+    }
+    let status = status_line(state, now);
+    let mut kept = vec![status.clone()];
+    let mut size = status.chars().count();
+    for line in lines.into_iter().rev() {
+        let n = line.chars().count() + 1;
+        if size + n > MAX_MSG {
+            break;
+        }
+        kept.push(line);
+        size += n;
+    }
+    kept.reverse();
+    kept.join("\n")
+}
+
+fn compact_snapshot(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let trimmed = l.trim();
+            if trimmed.starts_with("▸ ") {
+                compact_tool_line(trimmed)
+            } else {
+                let clipped: String = trimmed.chars().take(300).collect();
+                if trimmed.chars().count() > 300 {
+                    format!("{clipped}…")
+                } else {
+                    clipped
+                }
+            }
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn button_rows(items: Vec<(String, String)>) -> Option<Value> {
     if items.is_empty() {
         return None;
@@ -436,7 +526,11 @@ fn status_from_cfg(sid: &str, c: Option<&BridgeConfig>) -> Value {
     let (err, connected) = rt()
         .lock()
         .ok()
-        .and_then(|r| r.bridges.get(sid).map(|b| (b.last_error.clone(), b.connected)))
+        .and_then(|r| {
+            r.bridges
+                .get(sid)
+                .map(|b| (b.last_error.clone(), b.connected))
+        })
         .unwrap_or_default();
     json!({
         "sessionId": sid,
@@ -507,7 +601,11 @@ async fn handle_bridge_rpc(method: &str, params: &Value) -> Result<Value, String
                 return Err("That doesn't look like a Discord bot token. Copy it from the Discord Developer Portal → Bot → Reset Token.".into());
             }
             let mut s = load_store();
-            if let Some((_, other)) = s.bridges.iter().find(|(k, v)| k.as_str() != sid && v.token == token) {
+            if let Some((_, other)) = s
+                .bridges
+                .iter()
+                .find(|(k, v)| k.as_str() != sid && v.token == token)
+            {
                 let label = if other.bot_username.is_empty() {
                     "This bot".to_string()
                 } else {
@@ -518,8 +616,16 @@ async fn handle_bridge_rpc(method: &str, params: &Value) -> Result<Value, String
                 ));
             }
             let me = discord_req(reqwest::Method::GET, &token, "/users/@me", None).await?;
-            let bot_id = me.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let bot_username = me.get("username").and_then(Value::as_str).unwrap_or("").to_string();
+            let bot_id = me
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let bot_username = me
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if bot_id.is_empty() {
                 return Err("Discord returned an invalid bot user.".into());
             }
@@ -544,7 +650,10 @@ async fn handle_bridge_rpc(method: &str, params: &Value) -> Result<Value, String
         "bridge_set" => {
             let sid = sid()?;
             let mut s = load_store();
-            let c = s.bridges.get_mut(&sid).ok_or("no bot token saved for this session")?;
+            let c = s
+                .bridges
+                .get_mut(&sid)
+                .ok_or("no bot token saved for this session")?;
             if let Some(e) = params.get("enabled").and_then(Value::as_bool) {
                 c.enabled = e;
             }
@@ -555,7 +664,10 @@ async fn handle_bridge_rpc(method: &str, params: &Value) -> Result<Value, String
         "bridge_unpair" => {
             let sid = sid()?;
             let mut s = load_store();
-            let c = s.bridges.get_mut(&sid).ok_or("no bot token saved for this session")?;
+            let c = s
+                .bridges
+                .get_mut(&sid)
+                .ok_or("no bot token saved for this session")?;
             c.user_id = None;
             c.channel_id = None;
             c.user_name.clear();
@@ -576,22 +688,69 @@ async fn handle_bridge_rpc(method: &str, params: &Value) -> Result<Value, String
 // ---------- Turn event mirroring (host -> Discord) ----------
 
 async fn handle_turn_event(params: &Value) {
-    let Some(sid) = params.get("sessionId").and_then(Value::as_str) else { return };
-    let Some(event) = params.get("event").and_then(Value::as_str) else { return };
-    let turn_id = params.get("turnId").and_then(Value::as_str).unwrap_or("").to_string();
+    let Some(sid) = params.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(event) = params.get("event").and_then(Value::as_str) else {
+        return;
+    };
+    let turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
-    let Some(cfg) = load_store().bridges.remove(sid) else { return };
+    let Some(cfg) = load_store().bridges.remove(sid) else {
+        return;
+    };
     if cfg.token.is_empty() || !cfg.enabled {
         return;
     }
-    let Some(channel_id) = cfg.channel_id else { return };
+    let Some(channel_id) = cfg.channel_id else {
+        return;
+    };
 
     match event {
         "started" => {
             if let Some(mid) = send_message(&cfg.token, &channel_id, "⏳ Working…", None).await {
                 if let Ok(mut r) = rt().lock() {
-                    r.bridges.entry(sid.to_string()).or_default().progress_msg.insert(turn_id, mid);
+                    let b = r.bridges.entry(sid.to_string()).or_default();
+                    b.progress_msg.insert(turn_id.clone(), mid.clone());
+                    b.turns.insert(
+                        turn_id.clone(),
+                        TurnProgress {
+                            started: Instant::now(),
+                            current_tool: None,
+                            tool_started: None,
+                            tool_lines: Vec::new(),
+                            snapshot: String::new(),
+                        },
+                    );
                 }
+                let token = cfg.token.clone();
+                let channel_id = channel_id.clone();
+                let sid = sid.to_string();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(12));
+                    loop {
+                        tick.tick().await;
+                        let state = rt().lock().ok().and_then(|r| {
+                            r.bridges
+                                .get(&sid)
+                                .and_then(|b| b.turns.get(&turn_id).cloned())
+                        });
+                        let Some(state) = state else { break };
+                        trigger_typing(&token, &channel_id).await;
+                        edit_message(
+                            &token,
+                            &channel_id,
+                            &mid,
+                            &progress_content(&state, Instant::now()),
+                            None,
+                        )
+                        .await;
+                    }
+                });
             }
         }
         "progress" => {
@@ -599,14 +758,96 @@ async fn handle_turn_event(params: &Value) {
             if text.is_empty() {
                 return;
             }
-            let mid = rt()
+            let (mid, content) = rt()
                 .lock()
                 .ok()
-                .and_then(|r| r.bridges.get(sid).and_then(|b| b.progress_msg.get(&turn_id).cloned()));
-            if let Some(mid) = mid {
-                let n = text.chars().count();
-                let tail: String = text.chars().skip(n.saturating_sub(MAX_MSG - 40)).collect();
-                edit_message(&cfg.token, &channel_id, &mid, &format!("⏳ {tail}"), None).await;
+                .and_then(|mut r| {
+                    let b = r.bridges.get_mut(sid)?;
+                    let mid = b.progress_msg.get(&turn_id)?.clone();
+                    let state = b.turns.get_mut(&turn_id)?;
+                    state.snapshot = text.to_string();
+                    let observed = text.lines().rev().find_map(|line| {
+                        let line = line.trim().strip_prefix("▸ ")?;
+                        let name = line.split(':').next().unwrap_or(line).trim();
+                        (!name.is_empty()).then(|| name.to_string())
+                    });
+                    if let Some(name) = observed {
+                        if state.current_tool.as_deref() != Some(name.as_str()) {
+                            state.current_tool = Some(name);
+                            state.tool_started = Some(Instant::now());
+                        }
+                    }
+                    Some((mid, progress_content(state, Instant::now())))
+                })
+                .unwrap_or_default();
+            if !mid.is_empty() {
+                edit_message(&cfg.token, &channel_id, &mid, &content, None).await;
+            }
+        }
+        "toolstart" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let args = params.get("args").unwrap_or(&Value::Null);
+            let detail = args
+                .get("command")
+                .or_else(|| args.get("description"))
+                .or_else(|| args.get("query"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let label = if detail.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}: {detail}")
+            };
+            let (mid, content) = rt()
+                .lock()
+                .ok()
+                .and_then(|mut r| {
+                    let b = r.bridges.get_mut(sid)?;
+                    let mid = b.progress_msg.get(&turn_id)?.clone();
+                    let state = b.turns.get_mut(&turn_id)?;
+                    state.current_tool = Some(name.to_string());
+                    state.tool_started = Some(Instant::now());
+                    state.tool_lines.push(compact_tool_line(&label));
+                    Some((mid, progress_content(state, Instant::now())))
+                })
+                .unwrap_or_default();
+            if !mid.is_empty() {
+                edit_message(&cfg.token, &channel_id, &mid, &content, None).await;
+            }
+        }
+        "toolend" => {
+            let (mid, content) = rt()
+                .lock()
+                .ok()
+                .and_then(|mut r| {
+                    let b = r.bridges.get_mut(sid)?;
+                    let mid = b.progress_msg.get(&turn_id)?.clone();
+                    let state = b.turns.get_mut(&turn_id)?;
+                    state.current_tool = None;
+                    state.tool_started = None;
+                    Some((mid, progress_content(state, Instant::now())))
+                })
+                .unwrap_or_default();
+            if !mid.is_empty() {
+                edit_message(&cfg.token, &channel_id, &mid, &content, None).await;
+            }
+        }
+        "error" => {
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Turn failed");
+            finish_progress(sid, &turn_id);
+            let marker = format!(
+                "❌ Error: {}",
+                message.chars().take(300).collect::<String>()
+            );
+            if let Some(mid) = rt().lock().ok().and_then(|r| {
+                r.bridges
+                    .get(sid)
+                    .and_then(|b| b.progress_msg.get(&turn_id).cloned())
+            }) {
+                edit_message(&cfg.token, &channel_id, &mid, &marker, None).await;
             }
         }
         "ask" => {
@@ -617,10 +858,22 @@ async fn handle_turn_event(params: &Value) {
             let opts: Vec<String> = params
                 .get("options")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
-            let freeform = params.get("freeform").and_then(Value::as_bool).unwrap_or(false);
-            let hint = if freeform { "\n\n(Click a choice or reply with text.)" } else { "" };
+            let freeform = params
+                .get("freeform")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let hint = if freeform {
+                "\n\n(Click a choice or reply with text.)"
+            } else {
+                ""
+            };
             let btns = button_rows(
                 opts.iter()
                     .enumerate()
@@ -634,11 +887,15 @@ async fn handle_turn_event(params: &Value) {
                 .get("reply")
                 .and_then(Value::as_str)
                 .unwrap_or("(no reply text)");
-            let mid = rt()
-                .lock()
-                .ok()
-                .and_then(|mut r| r.bridges.get_mut(sid).and_then(|b| b.progress_msg.remove(&turn_id)));
-            let parts = chunks(reply);
+            let mid = rt().lock().ok().and_then(|mut r| {
+                let b = r.bridges.get_mut(sid)?;
+                b.turns.remove(&turn_id);
+                b.progress_msg.remove(&turn_id)
+            });
+            let stopped = params.get("stopped").and_then(Value::as_bool) == Some(true);
+            let terminal = if stopped { "⏹ Stopped" } else { "✅ Done" };
+            let reply = format!("{reply}\n\n{terminal}");
+            let parts = chunks(&reply);
             let mut it = parts.iter();
             if let (Some(m), Some(first)) = (mid, it.next()) {
                 edit_message(&cfg.token, &channel_id, &m, first, None).await;
@@ -650,6 +907,14 @@ async fn handle_turn_event(params: &Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn finish_progress(sid: &str, turn_id: &str) {
+    if let Ok(mut r) = rt().lock() {
+        if let Some(b) = r.bridges.get_mut(sid) {
+            b.turns.remove(turn_id);
+        }
     }
 }
 
@@ -725,7 +990,8 @@ async fn run_gateway_loop(host: Arc<HostClient>, sid: String) {
 
         let gw_base = match resume_url.clone() {
             Some(u) => u,
-            None => match discord_req(reqwest::Method::GET, &cfg.token, "/gateway/bot", None).await {
+            None => match discord_req(reqwest::Method::GET, &cfg.token, "/gateway/bot", None).await
+            {
                 Ok(v) => v
                     .get("url")
                     .and_then(Value::as_str)
@@ -797,7 +1063,10 @@ async fn run_gateway_loop(host: Arc<HostClient>, sid: String) {
                     if let Some(cf) = c {
                         let code: u16 = cf.code.into();
                         if matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014) {
-                            set_error(&sid, format!("Discord closed gateway ({code}): {}", cf.reason));
+                            set_error(
+                                &sid,
+                                format!("Discord closed gateway ({code}): {}", cf.reason),
+                            );
                             should_clear_resume = true;
                         }
                     }
@@ -806,7 +1075,9 @@ async fn run_gateway_loop(host: Arc<HostClient>, sid: String) {
                 _ => continue,
             };
 
-            let Ok(payload) = serde_json::from_str::<Value>(&text) else { continue };
+            let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if let Some(s) = payload.get("s").and_then(Value::as_u64) {
                 seq = Some(s);
                 seq_shared.store(s, Ordering::Relaxed);
@@ -834,7 +1105,10 @@ async fn run_gateway_loop(host: Arc<HostClient>, sid: String) {
                             } else {
                                 Value::Null
                             };
-                            if tx_hb.send(WsMsg::Text(json!({ "op": 1, "d": d }).to_string().into())).is_err() {
+                            if tx_hb
+                                .send(WsMsg::Text(json!({ "op": 1, "d": d }).to_string().into()))
+                                .is_err()
+                            {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(interval)).await;
@@ -878,8 +1152,14 @@ async fn run_gateway_loop(host: Arc<HostClient>, sid: String) {
                     let d = payload.get("d").cloned().unwrap_or(Value::Null);
                     match t {
                         "READY" => {
-                            session_id_gw = d.get("session_id").and_then(Value::as_str).map(str::to_string);
-                            resume_url = d.get("resume_gateway_url").and_then(Value::as_str).map(str::to_string);
+                            session_id_gw = d
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            resume_url = d
+                                .get("resume_gateway_url")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             set_connected(&sid, true, true);
                         }
                         "RESUMED" => {
@@ -932,7 +1212,9 @@ async fn handle_discord_interaction(
     d: &Value,
 ) -> Result<(), String> {
     let s = load_store();
-    let Some(c) = s.bridges.get(sid) else { return Ok(()) };
+    let Some(c) = s.bridges.get(sid) else {
+        return Ok(());
+    };
     let token = c.token.clone();
     let iid = d.get("id").and_then(Value::as_str).unwrap_or("");
     let itok = d.get("token").and_then(Value::as_str).unwrap_or("");
@@ -944,8 +1226,14 @@ async fn handle_discord_interaction(
         ack_interaction_defer_update(&token, iid, itok).await;
         return Ok(());
     }
-    let custom_id = d.pointer("/data/custom_id").and_then(Value::as_str).unwrap_or("");
-    let orig_text = d.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
+    let custom_id = d
+        .pointer("/data/custom_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let orig_text = d
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let channel_id = d
         .get("channel_id")
         .and_then(Value::as_str)
@@ -968,7 +1256,14 @@ async fn handle_discord_interaction(
             Ok(v) => {
                 let shown = v.get("shown").and_then(Value::as_str).unwrap_or("answered");
                 if let Some(mid) = msg_id {
-                    edit_message(&token, channel_id, mid, &format!("{orig_text}\n\n→ {shown}"), Some(json!([]))).await;
+                    edit_message(
+                        &token,
+                        channel_id,
+                        mid,
+                        &format!("{orig_text}\n\n→ {shown}"),
+                        Some(json!([])),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -981,7 +1276,14 @@ async fn handle_discord_interaction(
         ack_interaction_defer_update(&token, iid, itok).await;
         let (text, comps) = pick_engine(host, sid, eng).await;
         if let Some(mid) = d.pointer("/message/id").and_then(Value::as_str) {
-            edit_message(&token, channel_id, mid, &text, Some(comps.unwrap_or_else(|| json!([])))).await;
+            edit_message(
+                &token,
+                channel_id,
+                mid,
+                &text,
+                Some(comps.unwrap_or_else(|| json!([]))),
+            )
+            .await;
         }
         return Ok(());
     }
@@ -1011,11 +1313,24 @@ async fn handle_discord_message(
     }
 
     let mut s = load_store();
-    let Some(c) = s.bridges.get_mut(sid) else { return Ok(()) };
+    let Some(c) = s.bridges.get_mut(sid) else {
+        return Ok(());
+    };
     let token = c.token.clone();
-    let from_id = msg.pointer("/author/id").and_then(Value::as_str).map(str::to_string);
-    let channel_id = msg.get("channel_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let text = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let from_id = msg
+        .pointer("/author/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let channel_id = msg
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let text = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     if c.user_id.is_none() {
         if is_pair_attempt(&text, &c.pair_code) {
@@ -1031,8 +1346,14 @@ async fn handle_discord_message(
             c.pair_code.clear();
             save_store(&s)?;
             bump_session(sid);
-            let info = host.call("session_info", json!({ "sessionId": sid })).await.unwrap_or(Value::Null);
-            let title = info.get("title").and_then(Value::as_str).unwrap_or("this session");
+            let info = host
+                .call("session_info", json!({ "sessionId": sid }))
+                .await
+                .unwrap_or(Value::Null);
+            let title = info
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("this session");
             send_message(
                 &token,
                 &channel_id,
@@ -1061,12 +1382,24 @@ async fn handle_discord_message(
         let _ = save_store(&s);
     }
 
-    let info = host.call("session_info", json!({ "sessionId": sid })).await?;
+    let info = host
+        .call("session_info", json!({ "sessionId": sid }))
+        .await?;
     if info.get("exists").and_then(Value::as_bool) != Some(true) {
-        send_message(&token, &channel_id, "⚠️ The session bound to this bot no longer exists in Vicuna.", None).await;
+        send_message(
+            &token,
+            &channel_id,
+            "⚠️ The session bound to this bot no longer exists in Vicuna.",
+            None,
+        )
+        .await;
         return Ok(());
     }
-    let title = info.get("title").and_then(Value::as_str).unwrap_or("This session").to_string();
+    let title = info
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("This session")
+        .to_string();
     let t = text.trim();
 
     if t == "!help" {
@@ -1080,16 +1413,35 @@ async fn handle_discord_message(
         return Ok(());
     }
     if t == "!status" {
-        let state = if info.get("working").and_then(Value::as_bool) == Some(true) { "working" } else { "idle" };
+        let state = if info.get("working").and_then(Value::as_bool) == Some(true) {
+            "working"
+        } else {
+            "idle"
+        };
         let engine = info.get("engine").and_then(Value::as_str).unwrap_or("?");
-        let model = info.get("model").and_then(Value::as_str).unwrap_or("default");
-        send_message(&token, &channel_id, &format!("\"{title}\" is {state} · {engine}/{model}"), None).await;
+        let model = info
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        send_message(
+            &token,
+            &channel_id,
+            &format!("\"{title}\" is {state} · {engine}/{model}"),
+            None,
+        )
+        .await;
         return Ok(());
     }
     if t == "!stop" {
         let r = host.call("stop_turn", json!({ "sessionId": sid })).await?;
         if r.get("stopped").and_then(Value::as_bool) == Some(true) {
-            send_message(&token, &channel_id, &format!("⏹ Stopping \"{title}\"…"), None).await;
+            send_message(
+                &token,
+                &channel_id,
+                &format!("⏹ Stopping \"{title}\"…"),
+                None,
+            )
+            .await;
         } else {
             send_message(&token, &channel_id, &format!("\"{title}\" is idle."), None).await;
         }
@@ -1105,10 +1457,19 @@ async fn handle_discord_message(
             [] => model_overview(host, &info).await,
             [e] => pick_engine(host, sid, e).await,
             [e, m, ..] => match host
-                .call("set_model", json!({ "sessionId": sid, "engine": e, "model": m }))
+                .call(
+                    "set_model",
+                    json!({ "sessionId": sid, "engine": e, "model": m }),
+                )
                 .await
             {
-                Ok(v) => (v.get("message").and_then(Value::as_str).unwrap_or("Updated.").to_string(), None),
+                Ok(v) => (
+                    v.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Updated.")
+                        .to_string(),
+                    None,
+                ),
                 Err(e) => (format!("⚠️ {e}"), None),
             },
         };
@@ -1118,7 +1479,10 @@ async fn handle_discord_message(
 
     // Free-form text reply answers a waiting ask card
     if !t.is_empty() && info.get("pendingAsk").and_then(Value::as_bool) == Some(true) {
-        match host.call("answer_ask", json!({ "sessionId": sid, "text": t })).await {
+        match host
+            .call("answer_ask", json!({ "sessionId": sid, "text": t }))
+            .await
+        {
             Ok(_) => return Ok(()),
             Err(e) => {
                 send_message(&token, &channel_id, &format!("⚠️ {e}"), None).await;
@@ -1134,33 +1498,66 @@ async fn handle_discord_message(
 
     if let Some(atts) = msg.get("attachments").and_then(Value::as_array) {
         for att in atts {
-            let Some(url) = att.get("url").and_then(Value::as_str) else { continue };
-            let name = att.get("filename").and_then(Value::as_str).unwrap_or("file").to_string();
-            let ctype = att.get("content_type").and_then(Value::as_str).unwrap_or("");
+            let Some(url) = att.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = att
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .to_string();
+            let ctype = att
+                .get("content_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let size = att.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
             if size > MAX_FILE {
-                send_message(&token, &channel_id, &format!("⚠️ {name} is over 20 MB."), None).await;
+                send_message(
+                    &token,
+                    &channel_id,
+                    &format!("⚠️ {name} is over 20 MB."),
+                    None,
+                )
+                .await;
                 continue;
             }
             let Ok(resp) = http().get(url).send().await else {
-                send_message(&token, &channel_id, &format!("⚠️ Couldn't download {name}."), None).await;
+                send_message(
+                    &token,
+                    &channel_id,
+                    &format!("⚠️ Couldn't download {name}."),
+                    None,
+                )
+                .await;
                 continue;
             };
-            let Ok(bytes) = resp.bytes().await else { continue };
+            let Ok(bytes) = resp.bytes().await else {
+                continue;
+            };
             if bytes.len() > MAX_FILE {
                 continue;
             }
 
             // Voice message (.ogg / audio/ogg)
-            let is_voice = ctype.starts_with("audio/ogg") || name.to_ascii_lowercase().ends_with(".ogg");
+            let is_voice =
+                ctype.starts_with("audio/ogg") || name.to_ascii_lowercase().ends_with(".ogg");
             if is_voice {
                 trigger_typing(&token, &channel_id).await;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 if let Ok(v) = host.call("transcribe_ogg", json!({ "base64": b64 })).await {
                     if v.get("available").and_then(Value::as_bool) == Some(true) {
-                        if let Some(tx) = v.get("text").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Some(tx) = v
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
                             send_message(&token, &channel_id, &format!("🎙 {tx}"), None).await;
-                            text_out = if text_out.is_empty() { tx.to_string() } else { format!("{text_out}\n\n{tx}") };
+                            text_out = if text_out.is_empty() {
+                                tx.to_string()
+                            } else {
+                                format!("{text_out}\n\n{tx}")
+                            };
                             continue;
                         }
                     }
@@ -1176,7 +1573,10 @@ async fn handle_discord_message(
             } else {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 match host
-                    .call("stage_upload", json!({ "sessionId": sid, "name": name, "base64": b64 }))
+                    .call(
+                        "stage_upload",
+                        json!({ "sessionId": sid, "name": name, "base64": b64 }),
+                    )
                     .await
                 {
                     Ok(v) => {
@@ -1185,7 +1585,13 @@ async fn handle_discord_message(
                         }
                     }
                     Err(e) => {
-                        send_message(&token, &channel_id, &format!("⚠️ Couldn't save {name}: {e}"), None).await;
+                        send_message(
+                            &token,
+                            &channel_id,
+                            &format!("⚠️ Couldn't save {name}: {e}"),
+                            None,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1234,7 +1640,13 @@ async fn send_now_reply(host: &Arc<HostClient>, sid: &str, token: &str, channel_
     tokio::spawn(async move {
         match host.call("send_now", json!({ "sessionId": sid })).await {
             Ok(v) if v.get("sent").and_then(Value::as_u64) == Some(0) => {
-                send_message(&token, &channel_id, "Nothing is queued: your messages already reached the session.", None).await;
+                send_message(
+                    &token,
+                    &channel_id,
+                    "Nothing is queued: your messages already reached the session.",
+                    None,
+                )
+                .await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -1246,7 +1658,10 @@ async fn send_now_reply(host: &Arc<HostClient>, sid: &str, token: &str, channel_
 
 async fn model_overview(host: &Arc<HostClient>, info: &Value) -> (String, Option<Value>) {
     let engine = info.get("engine").and_then(Value::as_str).unwrap_or("?");
-    let model = info.get("model").and_then(Value::as_str).unwrap_or("default");
+    let model = info
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
     let engines = host
         .call("list_engines", json!({}))
         .await
@@ -1274,7 +1689,12 @@ async fn pick_engine(host: &Arc<HostClient>, sid: &str, eng: &str) -> (String, O
         Ok(v) => v
             .get("models")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default(),
         Err(e) => return (format!("⚠️ {e}"), None),
     };
@@ -1303,17 +1723,26 @@ async fn pick_model(host: &Arc<HostClient>, sid: &str, i: usize) -> String {
         return "⚠️ Unknown model.".into();
     };
     match host
-        .call("set_model", json!({ "sessionId": sid, "engine": engine, "model": model }))
+        .call(
+            "set_model",
+            json!({ "sessionId": sid, "engine": engine, "model": model }),
+        )
         .await
     {
-        Ok(v) => v.get("message").and_then(Value::as_str).unwrap_or("Updated.").to_string(),
+        Ok(v) => v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Updated.")
+            .to_string(),
         Err(e) => format!("⚠️ {e}"),
     }
 }
 
 fn is_image_name(n: &str) -> bool {
     let l = n.to_ascii_lowercase();
-    [".jpg", ".jpeg", ".png", ".webp", ".gif"].iter().any(|e| l.ends_with(e))
+    [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+        .iter()
+        .any(|e| l.ends_with(e))
 }
 
 fn image_mime(n: &str) -> &'static str {
@@ -1352,7 +1781,9 @@ async fn main() {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let id = v.get("id").and_then(Value::as_u64);
         let method = v.get("method").and_then(Value::as_str).map(str::to_string);
 
@@ -1412,5 +1843,30 @@ mod tests {
         assert_eq!(p.len(), 3);
         assert!(p.iter().all(|s| s.len() <= MAX_MSG));
         assert_eq!(chunks("hello\nworld"), vec!["hello\nworld".to_string()]);
+    }
+
+    #[test]
+    fn tool_lines_are_single_line_escaped_and_truncated() {
+        assert_eq!(
+            compact_tool_line("▸ exec: echo `hi`\nsecond line"),
+            "▸ `exec: echo ˋhiˋ`"
+        );
+        let line = compact_tool_line(&format!("exec: {}", "x".repeat(180)));
+        assert!(line.ends_with("…`"));
+        assert!(line.chars().count() <= 140);
+    }
+
+    #[test]
+    fn status_line_shows_elapsed_and_running_tool() {
+        let started = Instant::now() - Duration::from_secs(67);
+        let state = TurnProgress {
+            started,
+            current_tool: Some("exec".into()),
+            tool_started: Some(Instant::now() - Duration::from_secs(9)),
+            tool_lines: Vec::new(),
+            snapshot: String::new(),
+        };
+        let line = status_line(&state, Instant::now());
+        assert!(line.starts_with("⏳ Working… 1m 07s · exec running 9s"));
     }
 }
